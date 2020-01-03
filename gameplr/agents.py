@@ -9,7 +9,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 import gym
 
-from gameplr.policies import MLP
+from gameplr.policies import KLineMLP
 from simple_games.envs import SimEnv, TicTacToeEnv, HexapawnEnv
 
 class DQN():
@@ -29,7 +29,7 @@ class DQN():
             self.input_dim = input_dim
             self.output_dim = output_dim
             self.agnostic = agnostic
-            self.make_envs = [TicTacToeEnv]
+            self.make_envs = [HexapawnEnv, TicTacToeEnv]
             self.setup_envs()
         else:
             self.make_envs = [TicTacToeEnv]
@@ -39,7 +39,7 @@ class DQN():
 
 
         # hyperparameters (manually set)
-        self.min_eps = torch.Tensor(np.array(0.03))
+        self.min_eps = torch.Tensor(np.array(0.005))
         self.eps = torch.Tensor(np.array(0.90))
         self.lr = 3e-4
         self.lr_decay = 1 - 3e-3
@@ -49,8 +49,8 @@ class DQN():
         self.update_qt = 10
 
         self.epochs = epochs
-        self.steps_per_epoch = {'HexapawnEnv': 5000,\
-                            'TicTacToeEnv': 7500,\
+        self.steps_per_epoch = {'HexapawnEnv': 1000,\
+                            'TicTacToeEnv': 1500,\
                             'SimEnv': 20000}
         self.device = torch.device("cpu")
         self.discount = 0.9
@@ -60,7 +60,7 @@ class DQN():
         self.qt = [None] * 2
         for player in [0,1]:
 
-            self.q[player] = MLP(self.input_dim, self.output_dim, hid_dim=hid_dim, act=nn.LeakyReLU) \
+            self.q[player] = KLineMLP(self.input_dim, self.output_dim, hid_dim=hid_dim, act=nn.LeakyReLU) \
                     #Tanh)
             try:
                 fpath = "q_weights_exp{}.h5".format(exp_name) 
@@ -70,7 +70,7 @@ class DQN():
             except:
                 pass
 
-            self.qt[player] = MLP(self.input_dim, self.output_dim, hid_dim=hid_dim, act=nn.LeakyReLU)
+            self.qt[player] = KLineMLP(self.input_dim, self.output_dim, hid_dim=hid_dim, act=nn.LeakyReLU)
             self.qt[player].load_state_dict(copy.deepcopy(self.q[player].state_dict()))
 
             self.q[player] = self.q[player].to(self.device)
@@ -90,6 +90,8 @@ class DQN():
 
         self.input_adapter = {}
         self.output_adapter = {}
+        self.seeds = {}
+        seed = 0
 
         for make_env in self.make_envs:
             env = make_env()
@@ -98,11 +100,12 @@ class DQN():
             self.envs[env_name] = env
             obs = self.envs[env_name].reset()
             self.seed = my_seed
-            torch.manual_seed = my_seed
+            torch.manual_seed(my_seed)
 
             self.act_dim[env_name] = self.envs[env_name].action_space.n
             self.obs_dim[env_name] = self.envs[env_name].observation_space.shape[0]
-
+            self.seeds[env_name] = seed
+            #seed += 1
             if self.agnostic:
                 # use random linear transformations as adapters for agnosticism
                 self.input_adapter[env_name] = torch.randn(\
@@ -116,159 +119,12 @@ class DQN():
                 self.input_adapter[env_name] = torch.eye(self.obs_dim[env_name])
                 self.output_adapter[env_name] = torch.eye(self.act_dim[env_name])
 
-    def compute_q_loss(self, l_obs, l_act, l_rew, l_next_obs, l_done,\
-            player=0, double=True):
-
-        env_name = self.env_name
-        with torch.no_grad():
-
-            l_next_input = torch.matmul(l_next_obs, \
-                    self.input_adapter[env_name])
-            qt_out = self.qt[player].forward(l_next_input)
-            qt = torch.matmul(qt_out, self.output_adapter[env_name])
-            if double:
-                qtq_out = self.q[player].forward(l_next_input)
-                qtq = torch.matmul(qtq_out, self.output_adapter[env_name])
-                qt_max = torch.gather(qt, -1,\
-                        torch.argmax(qtq, dim=-1).unsqueeze(-1))
-            else:
-                qt_max = torch.gather(qt, -1, \
-                        torch.argmax(qt, dim=-1).unsqueeze(-1))
-
-            yj = l_rew + ((1-l_done) * self.discount * qt_max)
-
-        l_input = torch.matmul(l_obs, \
-                self.input_adapter[env_name])
-        l_act = l_act.long()
-        q_av_out = self.q[player].forward(l_input)
-        q_av = torch.matmul(q_av_out, self.output_adapter[env_name])
-        q_act = torch.gather(q_av, -1, l_act)
-
-        loss =  torch.mean(torch.pow(yj - q_act, 2))
-
-        return loss
-
-
-    def get_episodes(self,player=0,steps=None):
-        
-
-        l_obs = torch.Tensor()
-        l_rew = torch.Tensor()
-        l_act = torch.Tensor()
-        l_done = torch.Tensor()
-        l_next_obs = torch.Tensor()
-        done = True
-
-        env_name = self.env_name
-        if steps == None:
-            steps = self.steps_per_epoch[env_name]
-
-        with torch.no_grad():
-            for step in range(steps):
-
-                if done:
-                    obs = self.env.reset()
-                    obs = torch.Tensor(obs.ravel()).unsqueeze(0)
-                    done = False
-
-                # Face off against opposing player
-                if player:
-                    if torch.rand(1) < self.eps:
-                        legal_moves = self.env.legal_moves if type(self.env.legal_moves[0]) is not list else self.env.legal_moves[int(not(player))]
-                        op_act = np.random.choice(legal_moves)
-                    else:
-                        op_input = torch.matmul(obs,\
-                                self.input_adapter[self.env_name])
-                        op_q_output = self.qt[not(player)](op_input)
-                        op_q_values = torch.matmul(op_q_output, \
-                                self.output_adapter[env_name])
-                        op_act = torch.argmax(op_q_values,dim=-1)
-                        op_act = op_act.detach().numpy()[0]
-                    op_obs, op_r, op_d, op_i = \
-                            self.env.step(op_act, player=int(not(player)))
-                    if op_r:
-                        done=True
-                    elif op_d:
-                        if env_name is not "SimEnv":
-                            obs = self.env.reset()
-                            obs = torch.Tensor(obs.ravel()).unsqueeze(0)
-                            done = False
-                        else:
-                            done = True
-                            l_done[-1] = torch.Tensor(np.array(1.0))
-                            l_rew[-1] = torch.Tensor(np.array(1.0))
-
-
-
-                if len(self.env.legal_moves) == 0: done = True
-
-                if not done: 
-                    if torch.rand(1) < self.eps:
-                        action = self.env.action_space.sample()
-
-                        legal_moves = self.env.legal_moves if type(self.env.legal_moves[0]) is not list else self.env.legal_moves[player]
-
-                        action = np.random.choice(legal_moves)
-                    else:
-                        # input/output adapter magic here
-                        my_input = torch.matmul(obs,\
-                                self.input_adapter[env_name])
-                        my_output = self.q[player](my_input)
-                        q_values = torch.matmul(my_output, \
-                                self.output_adapter[env_name])
-                        act = torch.argmax(q_values, dim=-1)
-                        # detach action to send it to the environment
-                        action = act.detach().numpy()[0]
-
-                    prev_obs = obs
-                    obs, reward, done, info = self.env.step(action, \
-                            player=player)
-
-                    obs = torch.Tensor(obs.ravel()).unsqueeze(0)
-
-                    # Face off against opposing player
-                    if not done and not player and len(self.env.legal_moves) >0:
-                        if torch.rand(1) < self.eps:
-                            legal_moves = self.env.legal_moves if type(self.env.legal_moves[0]) is not list else self.env.legal_moves[int(not(player))]
-                            op_act = np.random.choice(legal_moves)
-                        else:
-                            op_input = torch.matmul(obs,\
-                                    self.input_adapter[self.env_name])
-                            op_q_output = self.qt[not(player)](op_input)
-                            op_q_values = torch.matmul(op_q_output, \
-                                    self.output_adapter[env_name])
-                            op_act = torch.argmax(op_q_values,dim=-1)
-                            op_act = op_act.detach().numpy()[0]
-                        op_obs, op_r, op_d, op_i = \
-                                self.env.step(op_act, player=int(not(player)))
-                        if op_r:
-                            done=True
-                        elif op_d:
-                            if env_name is not "SimEnv":
-                                done = True
-                            else:
-                                done = True
-                                reward = 1.0
-
-                    # concatenate data from current step to buffers
-                    l_obs = torch.cat([l_obs, prev_obs], dim=0)
-                    l_rew = torch.cat([l_rew, torch.Tensor(np.array(1.* reward))\
-                            .reshape(1,1)], dim=0)
-                    l_act = torch.cat([l_act, torch.Tensor(np.array([action]))\
-                            .reshape(1,1)], dim=0)
-                    l_done = torch.cat([l_done, torch.Tensor(np.array(1.0*done))\
-                            .reshape(1,1)], dim=0)
-
-                    l_next_obs = torch.cat([l_next_obs, obs], dim=0)
-
-                    
-        return l_obs, l_act, l_rew, l_next_obs, l_done
-
     def train(self, exp_name, start_epoch):
         
         # initialize optimizer
         optimizer = [None] * 2
         scheduler = [None] * 2
+        
         for player in [0,1]:
             optimizer[player] = torch.optim.Adam(\
                     self.q[player].parameters(), lr=self.lr)
@@ -359,6 +215,159 @@ class DQN():
         #np.save("./results/{}/test_{}_epoch{}.npy".format(exp_name,exp_name,\
         #        epoch),results)
 
+    def compute_q_loss(self, l_obs, l_act, l_rew, l_next_obs, l_done,\
+            player=0, double=True):
+
+        env_name = self.env_name
+        with torch.no_grad():
+
+            l_next_input = torch.matmul(l_next_obs, \
+                    self.input_adapter[env_name])
+            qt_out = self.qt[player].forward(l_next_input, \
+                    kline=self.seeds[env_name])
+            qt = torch.matmul(qt_out, self.output_adapter[env_name])
+            if double:
+                qtq_out = self.q[player].forward(l_next_input,\
+                        kline=self.seeds[env_name])
+                qtq = torch.matmul(qtq_out, self.output_adapter[env_name])
+                qt_max = torch.gather(qt, -1,\
+                        torch.argmax(qtq, dim=-1).unsqueeze(-1))
+            else:
+                qt_max = torch.gather(qt, -1, \
+                        torch.argmax(qt, dim=-1).unsqueeze(-1))
+
+            yj = l_rew + ((1-l_done) * self.discount * qt_max)
+
+        l_input = torch.matmul(l_obs, \
+                self.input_adapter[env_name])
+        l_act = l_act.long()
+        q_av_out = self.q[player].forward(l_input, kline=self.seeds[env_name])
+        q_av = torch.matmul(q_av_out, self.output_adapter[env_name])
+        q_act = torch.gather(q_av, -1, l_act)
+
+        loss =  torch.mean(torch.pow(yj - q_act, 2))
+
+        return loss
+
+
+    def get_episodes(self,player=0,steps=None):
+        
+
+        l_obs = torch.Tensor()
+        l_rew = torch.Tensor()
+        l_act = torch.Tensor()
+        l_done = torch.Tensor()
+        l_next_obs = torch.Tensor()
+        done = True
+
+        env_name = self.env_name
+        if steps == None:
+            steps = self.steps_per_epoch[env_name]
+
+        with torch.no_grad():
+            for step in range(steps):
+
+                if done:
+                    obs = self.env.reset()
+                    obs = torch.Tensor(obs.ravel()).unsqueeze(0)
+                    done = False
+
+                # Face off against opposing player
+                if player:
+                    if torch.rand(1) < self.eps:
+                        legal_moves = self.env.legal_moves if type(self.env.legal_moves[0]) is not list else self.env.legal_moves[int(not(player))]
+                        op_act = np.random.choice(legal_moves)
+                    else:
+                        op_input = torch.matmul(obs,\
+                                self.input_adapter[self.env_name])
+                        op_q_output = self.qt[not(player)](op_input,\
+                                kline=self.seeds[env_name])
+                        op_q_values = torch.matmul(op_q_output, \
+                                self.output_adapter[env_name])
+                        op_act = torch.argmax(op_q_values,dim=-1)
+                        op_act = op_act.detach().numpy()[0]
+                    op_obs, op_r, op_d, op_i = \
+                            self.env.step(op_act, player=int(not(player)))
+                    if op_r:
+                        done=True
+                    elif op_d:
+                        if env_name is not "SimEnv":
+                            obs = self.env.reset()
+                            obs = torch.Tensor(obs.ravel()).unsqueeze(0)
+                            done = False
+                        else:
+                            done = True
+                            l_done[-1] = torch.Tensor(np.array(1.0))
+                            l_rew[-1] = torch.Tensor(np.array(1.0))
+
+
+
+                if len(self.env.legal_moves) == 0: done = True
+
+                if not done: 
+                    if torch.rand(1) < self.eps:
+                        action = self.env.action_space.sample()
+
+                        legal_moves = self.env.legal_moves if type(self.env.legal_moves[0]) is not list else self.env.legal_moves[player]
+
+                        action = np.random.choice(legal_moves)
+                    else:
+                        # input/output adapter magic here
+                        my_input = torch.matmul(obs,\
+                                self.input_adapter[env_name])
+                        my_output = self.q[player](my_input,\
+                                kline=self.seeds[env_name])
+                        q_values = torch.matmul(my_output, \
+                                self.output_adapter[env_name])
+                        act = torch.argmax(q_values, dim=-1)
+                        # detach action to send it to the environment
+                        action = act.detach().numpy()[0]
+
+                    prev_obs = obs
+                    obs, reward, done, info = self.env.step(action, \
+                            player=player)
+
+                    obs = torch.Tensor(obs.ravel()).unsqueeze(0)
+
+                    # Face off against opposing player
+                    if not done and not player and len(self.env.legal_moves) >0:
+                        if torch.rand(1) < self.eps:
+                            legal_moves = self.env.legal_moves if type(self.env.legal_moves[0]) is not list else self.env.legal_moves[int(not(player))]
+                            op_act = np.random.choice(legal_moves)
+                        else:
+                            op_input = torch.matmul(obs,\
+                                    self.input_adapter[self.env_name])
+                            op_q_output = self.qt[not(player)](op_input,\
+                                    kline=self.seeds[env_name])
+                            op_q_values = torch.matmul(op_q_output, \
+                                    self.output_adapter[env_name])
+                            op_act = torch.argmax(op_q_values,dim=-1)
+                            op_act = op_act.detach().numpy()[0]
+                        op_obs, op_r, op_d, op_i = \
+                                self.env.step(op_act, player=int(not(player)))
+                        if op_r:
+                            done=True
+                        elif op_d:
+                            if env_name is not "SimEnv":
+                                done = True
+                            else:
+                                done = True
+                                reward = 1.0
+
+                    # concatenate data from current step to buffers
+                    l_obs = torch.cat([l_obs, prev_obs], dim=0)
+                    l_rew = torch.cat([l_rew, torch.Tensor(np.array(1.* reward))\
+                            .reshape(1,1)], dim=0)
+                    l_act = torch.cat([l_act, torch.Tensor(np.array([action]))\
+                            .reshape(1,1)], dim=0)
+                    l_done = torch.cat([l_done, torch.Tensor(np.array(1.0*done))\
+                            .reshape(1,1)], dim=0)
+
+                    l_next_obs = torch.cat([l_next_obs, obs], dim=0)
+
+                    
+        return l_obs, l_act, l_rew, l_next_obs, l_done
+
 if __name__ == "__main__":
 
 
@@ -366,7 +375,7 @@ if __name__ == "__main__":
 
     for exp_name, agnostic in zip(["agnostic_exp","id_exp"],[True,False]):
         start_epoch = 0
-        dqn = DQN(hid_dim=[256,128,64],epochs=5000, agnostic=agnostic)
+        dqn = DQN(hid_dim=[256,128,64],epochs=750, agnostic=agnostic)
 
         dqn.train(exp_name, start_epoch)
     import pdb; pdb.set_trace()
