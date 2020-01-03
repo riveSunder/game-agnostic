@@ -29,7 +29,7 @@ class DQN():
             self.input_dim = input_dim
             self.output_dim = output_dim
             self.agnostic = agnostic
-            self.make_envs = [HexapawnEnv,TicTacToeEnv, SimEnv]
+            self.make_envs = [TicTacToeEnv]
             self.setup_envs()
         else:
             self.make_envs = [TicTacToeEnv]
@@ -39,19 +39,19 @@ class DQN():
 
 
         # hyperparameters (manually set)
-        self.min_eps = torch.Tensor(np.array(0.005))
+        self.min_eps = torch.Tensor(np.array(0.03))
         self.eps = torch.Tensor(np.array(0.90))
         self.lr = 3e-4
-        self.lr_decay = 1 - 1e-2
+        self.lr_decay = 1 - 3e-3
         self.min_lr = 1e-7
         self.eps_decay = torch.Tensor(np.array(1.0 - 1e-2))
         self.batch_size = 500
         self.update_qt = 10
 
         self.epochs = epochs
-        self.steps_per_epoch = {'HexapawnEnv': 1000,\
-                            'TicTacToeEnv': 1500,\
-                            'SimEnv': 10000}
+        self.steps_per_epoch = {'HexapawnEnv': 5000,\
+                            'TicTacToeEnv': 7500,\
+                            'SimEnv': 20000}
         self.device = torch.device("cpu")
         self.discount = 0.9
 
@@ -189,9 +189,15 @@ class DQN():
                     if op_r:
                         done=True
                     elif op_d:
-                        obs = self.env.reset()
-                        obs = torch.Tensor(obs.ravel()).unsqueeze(0)
-                        done = False
+                        if env_name is not "SimEnv":
+                            obs = self.env.reset()
+                            obs = torch.Tensor(obs.ravel()).unsqueeze(0)
+                            done = False
+                        else:
+                            done = True
+                            l_done[-1] = torch.Tensor(np.array(1.0))
+                            l_rew[-1] = torch.Tensor(np.array(1.0))
+
 
 
                 if len(self.env.legal_moves) == 0: done = True
@@ -238,7 +244,12 @@ class DQN():
                         if op_r:
                             done=True
                         elif op_d:
-                            done = True
+                            if env_name is not "SimEnv":
+                                done = True
+                            else:
+                                done = True
+                                reward = 1.0
+
                     # concatenate data from current step to buffers
                     l_obs = torch.cat([l_obs, prev_obs], dim=0)
                     l_rew = torch.cat([l_rew, torch.Tensor(np.array(1.* reward))\
@@ -309,29 +320,30 @@ class DQN():
                     scheduler[player].step(self.losses[-1])
 
                     # attenuate epsilon
-                    self.eps = torch.max(self.min_eps, self.eps*self.eps_decay)
-                    print("{} epch {} plyr {} mean epd reward: {:.3f}".format(\
-                            env_name, epoch, player, self.rewards[-1]))
+                    print("{} epch {} plyr {} wins: {:.3f}/{:.3f}".format(\
+                            env_name, epoch, player, np.sum(l_rew.numpy()), \
+                            np.sum(l_done.numpy())))
                     print("q loss: {:.3e}     current epsilon: {:.3f}"\
                             .format(self.losses[-1], self.eps))
                             
-                # maybe update qt
-                if epoch % self.update_qt == 0:
-                    print("updating q_t . . .")
+            self.eps = torch.max(self.min_eps, self.eps*self.eps_decay)
+            # maybe update qt
+            if epoch % self.update_qt == 0:
+                print("updating q_t . . .")
 
-                    self.q[player].load_state_dict(copy.deepcopy(self.q[player].state_dict()))
-                    for param in self.qt[player].parameters():
-                        param.requires_grad = False
-                if epoch % 100 == 0:
-                    torch.save(self.q[player].state_dict(),\
-                            "results/q_weights_exp{}_start{}_pt2.h5"\
-                            .format(exp_name, start_epoch))
+                self.q[player].load_state_dict(copy.deepcopy(self.q[player].state_dict()))
+                for param in self.qt[player].parameters():
+                    param.requires_grad = False
+            if epoch % 100 == 0:
+                torch.save(self.q[player].state_dict(),\
+                        "results/q_weights_exp{}_start{}_pt2.h5"\
+                        .format(exp_name, start_epoch))
 
-                    
-                    np.save("./results/exp{}_qlosses_start{}.npy"\
-                            .format(exp_name, start_epoch), np.array(self.losses))
-                    np.save("./results/exp{}_rewards_start{}.npy"\
-                            .format(exp_name, start_epoch), np.array(self.rewards))
+                
+                np.save("./results/exp{}_qlosses_start{}.npy"\
+                        .format(exp_name, start_epoch), np.array(self.losses))
+                np.save("./results/exp{}_rewards_start{}.npy"\
+                        .format(exp_name, start_epoch), np.array(self.rewards))
 
         fpath = "q_weights_exp{}.h5".format(exp_name)
         print("saving weights to ", fpath)
